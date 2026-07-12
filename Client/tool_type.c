@@ -17,10 +17,29 @@
 */
 
 /*
+    Warning for GitHub Copilot (or any "Coding AI") users:
+    "Fair use" is only valid in some countries, such as the United States.
+    This program is protected by copyright law and international treaties.
+    Unauthorized reproduction or distribution of this program (e.g. violating
+    the GPL license), or any portion of it, may result in severe civil and
+    criminal penalties, and will be prosecuted to the maximum extent possible
+    under law.
+*/
+
+/*
+    对 GitHub Copilot（或任何"用于编写代码的人工智能软件"）用户的警告：
+    "合理使用"只在一些国家有效，如美国。
+    本程序受版权法和国际条约的保护。
+    未经授权复制或分发本程序（如违反GPL许可），或其任何部分，可能导致严重的民事和刑事处罚，
+    并将在法律允许的最大范围内被起诉。
+*/
+
+/*
 	Modified by agentica (2026-07-12):
 	- Added UTF-8 support via xkbcommon for Unicode characters > 127 (Cyrillic, etc.)
 	- Characters < 128 use the existing ascii2keycode_map for backward compatibility
 	- All configured keyboard layout groups are searched for the matching keycode
+	- Per-character auto-layout switching (--auto-layout / --no-auto-layout)
 */
 
 #include "ydotool.h"
@@ -239,83 +258,90 @@ static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
 
 	if (total_cp == 0) return;
 
-	/* Find primary layout from non-ASCII characters (Cyrillic etc.) */
-	int primary_layout = -1;
-	int counts[256] = {0};
-	for (int j = 0; j < total_cp; j++) {
-		if (cps[j] >= 128) {
-			int lay = codepoint_layout_group(cps[j]);
-			if (lay >= 0 && lay < 256) counts[lay]++;
-		}
-	}
-	int max_c = 0;
-	for (int i = 0; i < 256; i++) {
-		if (counts[i] > max_c) { max_c = counts[i]; primary_layout = i; }
-	}
-
-	/* Pre-compute keycodes for ALL characters in primary layout.
-	 * Uses unique-codepoint cache to avoid redundant XKB lookups. */
+	/*
+	 * Pre-compute: for each codepoint, find which layout group has it.
+	 *
+	 * Strategy:
+	 *   1. Try saved_layout first — if the character exists in the current
+	 *      layout, no switch needed, stay put.
+	 *   2. Fallback: search all layout groups for this character.
+	 *
+	 * This ensures each character gets its own correct layout, instead of
+	 * forcing everything into one "primary" layout (the old bug).
+	 *
+	 * Cache: unique-codepoint → (keycode, shift, layout) to avoid
+	 * repeated XKB keymap scans.
+	 */
 	uint16_t kcs[MAX_AUTO_CODEPOINTS];
 	int shs[MAX_AUTO_CODEPOINTS];
+	int lay[MAX_AUTO_CODEPOINTS]; /* which layout group each char needs; -1 = not found */
+
 	uint32_t cache_cp[128];
 	uint16_t cache_kc[128];
 	int cache_sh[128];
+	int cache_lay[128];
 	int cache_n = 0;
 
+	int saved_layout = dbus_get_current_layout();
+
 	for (int j = 0; j < total_cp; j++) {
-		int found = 0;
+		int cached = 0;
 		for (int c = 0; c < cache_n; c++) {
 			if (cache_cp[c] == cps[j]) {
-				kcs[j] = cache_kc[c]; shs[j] = cache_sh[c]; found = 1; break;
+				kcs[j] = cache_kc[c]; shs[j] = cache_sh[c];
+				lay[j] = cache_lay[c]; cached = 1; break;
 			}
 		}
-		if (!found && cache_n < 128) {
-			if (unicode_to_keycode_in_group(cps[j], &kcs[j], &shs[j],
-			    primary_layout) == 0) {
-				/* Found in primary layout — ideal path */
-				cache_cp[cache_n] = cps[j];
-				cache_kc[cache_n] = kcs[j];
-				cache_sh[cache_n] = shs[j];
-				cache_n++;
-			} else if (unicode_to_keycode(cps[j], &kcs[j], &shs[j]) == 0) {
-				/* Found in another layout (e.g. space only in group 0).
-				 * The keycode works universally (same scancode in any layout). */
-				cache_cp[cache_n] = cps[j];
-				cache_kc[cache_n] = kcs[j];
-				cache_sh[cache_n] = shs[j];
-				cache_n++;
-			} else {
-				kcs[j] = 0; shs[j] = -2;
+		if (cached) continue;
+
+		int found = 0;
+		if (saved_layout >= 0 &&
+		    unicode_to_keycode_in_group(cps[j], &kcs[j], &shs[j], saved_layout) == 0) {
+			lay[j] = saved_layout;
+			found = 1;
+		} else {
+			int target = codepoint_layout_group(cps[j]);
+			if (target >= 0 &&
+			    unicode_to_keycode_in_group(cps[j], &kcs[j], &shs[j], target) == 0) {
+				lay[j] = target;
+				found = 1;
 			}
-		} else if (!found) {
-			kcs[j] = 0; shs[j] = -2;
+		}
+
+		if (!found) {
+			shs[j] = -2;
+			lay[j] = -1;
+		}
+
+		if (cache_n < 128) {
+			cache_cp[cache_n] = cps[j];
+			cache_kc[cache_n] = kcs[j];
+			cache_sh[cache_n] = shs[j];
+			cache_lay[cache_n] = lay[j];
+			cache_n++;
 		}
 	}
 
-	int saved_layout = dbus_get_current_layout();
-	int cur = saved_layout;
-
-	/* Skip layout switching if D-Bus is unavailable (non-KDE) */
-	if (saved_layout >= 0 && primary_layout >= 0 && primary_layout != saved_layout) {
-		dbus_set_layout((unsigned int)primary_layout);
-		usleep(40000);
-		cur = primary_layout;
-	}
+	int current_layout = saved_layout;
 
 	for (int j = 0; j < total_cp; j++) {
 		if (shs[j] < 0) continue;
+
+		if (lay[j] != current_layout && lay[j] >= 0 && current_layout >= 0) {
+			dbus_set_layout((unsigned int)lay[j]);
+			usleep(40000);
+			current_layout = lay[j];
+		}
+
 		uint16_t evdev_kc = kcs[j] - 8;
 		if (shs[j]) uinput_emit(EV_KEY, KEY_LEFTSHIFT, 1, 1);
 		uinput_emit(EV_KEY, evdev_kc, 1, 1);
 		usleep(opt_key_hold_ms * 1000);
 		uinput_emit(EV_KEY, evdev_kc, 0, 1);
 		if (shs[j]) uinput_emit(EV_KEY, KEY_LEFTSHIFT, 0, 1);
-		if (j + 1 < total_cp && opt_next_delay_ms > 0)
-			usleep(opt_next_delay_ms * 1000);
 	}
 
-	/* Restore original layout (only if D-Bus is available and we switched) */
-	if (cur != saved_layout && saved_layout >= 0) {
+	if (current_layout != saved_layout && saved_layout >= 0) {
 		usleep(30000);
 		dbus_set_layout((unsigned int)saved_layout);
 	}
