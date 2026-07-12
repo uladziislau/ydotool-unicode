@@ -171,17 +171,19 @@ static int unicode_to_keycode(uint32_t codepoint, uint16_t *out_keycode, int *ou
 
 // ---- Type a single Unicode codepoint via uinput ----
 
-static void type_unicode(uint32_t codepoint, bool delay) {
+	static void type_unicode(uint32_t codepoint, bool delay) {
 	uint16_t kc;
 	int shift;
 
 	if (unicode_to_keycode(codepoint, &kc, &shift) == 0) {
+		// Convert xkb_keycode_t (evdev + 8) to evdev code
+		uint16_t evdev_kc = kc - 8;
 		if (shift) {
 			uinput_emit(EV_KEY, KEY_LEFTSHIFT, 1, 1);
 		}
-		uinput_emit(EV_KEY, kc, 1, 1);
+		uinput_emit(EV_KEY, evdev_kc, 1, 1);
 		usleep(opt_key_hold_ms * 1000);
-		uinput_emit(EV_KEY, kc, 0, 1);
+		uinput_emit(EV_KEY, evdev_kc, 0, 1);
 		if (shift) {
 			uinput_emit(EV_KEY, KEY_LEFTSHIFT, 0, 1);
 		}
