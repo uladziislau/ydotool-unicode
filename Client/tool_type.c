@@ -182,12 +182,42 @@ static int codepoint_layout_group(uint32_t codepoint) {
 
 static void type_char(char c, bool delay);
 static void type_unicode(uint32_t codepoint, bool delay);
+static int unicode_to_keycode(uint32_t codepoint, uint16_t *out_keycode, int *out_shift);
+
+/* Like unicode_to_keycode but searches only a specific XKB layout group.
+ * Returns 0 on success, -1 if not found in that group. */
+static int unicode_to_keycode_in_group(uint32_t codepoint, uint16_t *out_keycode, int *out_shift, int group) {
+	if (!xkb_map || group < 0) return -1;
+
+	xkb_keysym_t target = xkb_utf32_to_keysym(codepoint);
+	if (target == XKB_KEY_NoSymbol) return -1;
+
+	xkb_keycode_t min_kc = xkb_keymap_min_keycode(xkb_map);
+	xkb_keycode_t max_kc = xkb_keymap_max_keycode(xkb_map);
+
+	for (xkb_keycode_t kc = min_kc; kc <= max_kc; kc++) {
+		xkb_layout_index_t num_lay = xkb_keymap_num_layouts_for_key(xkb_map, kc);
+		if ((xkb_layout_index_t)group >= num_lay) continue;
+		xkb_level_index_t num_lev = xkb_keymap_num_levels_for_key(xkb_map, kc, (xkb_layout_index_t)group);
+		for (xkb_level_index_t l = 0; l < num_lev; l++) {
+			const xkb_keysym_t *syms;
+			int n = xkb_keymap_key_get_syms_by_level(xkb_map, kc, (xkb_layout_index_t)group, l, &syms);
+			for (int i = 0; i < n; i++) {
+				if (syms[i] == target) {
+					*out_keycode = kc;
+					*out_shift = (l > 0) ? 1 : 0;
+					return 0;
+				}
+			}
+		}
+	}
+	return -1;
+}
 
 #define MAX_AUTO_CODEPOINTS 4096
 
 static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
 	uint32_t cps[MAX_AUTO_CODEPOINTS];
-	int cp_layout[MAX_AUTO_CODEPOINTS];
 	int total_cp = 0;
 	ssize_t i = 0;
 
@@ -209,37 +239,83 @@ static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
 
 	if (total_cp == 0) return;
 
-	int first_non_ascii_layout = -1;
+	/* Find primary layout from non-ASCII characters (Cyrillic etc.) */
+	int primary_layout = -1;
+	int counts[256] = {0};
 	for (int j = 0; j < total_cp; j++) {
-		if (cps[j] < 128) {
-			cp_layout[j] = 0;
-		} else {
-			cp_layout[j] = codepoint_layout_group(cps[j]);
-			if (first_non_ascii_layout < 0 && cp_layout[j] >= 0)
-				first_non_ascii_layout = cp_layout[j];
+		if (cps[j] >= 128) {
+			int lay = codepoint_layout_group(cps[j]);
+			if (lay >= 0 && lay < 256) counts[lay]++;
+		}
+	}
+	int max_c = 0;
+	for (int i = 0; i < 256; i++) {
+		if (counts[i] > max_c) { max_c = counts[i]; primary_layout = i; }
+	}
+
+	/* Pre-compute keycodes for ALL characters in primary layout.
+	 * Uses unique-codepoint cache to avoid redundant XKB lookups. */
+	uint16_t kcs[MAX_AUTO_CODEPOINTS];
+	int shs[MAX_AUTO_CODEPOINTS];
+	uint32_t cache_cp[128];
+	uint16_t cache_kc[128];
+	int cache_sh[128];
+	int cache_n = 0;
+
+	for (int j = 0; j < total_cp; j++) {
+		int found = 0;
+		for (int c = 0; c < cache_n; c++) {
+			if (cache_cp[c] == cps[j]) {
+				kcs[j] = cache_kc[c]; shs[j] = cache_sh[c]; found = 1; break;
+			}
+		}
+		if (!found && cache_n < 128) {
+			if (unicode_to_keycode_in_group(cps[j], &kcs[j], &shs[j],
+			    primary_layout) == 0) {
+				/* Found in primary layout — ideal path */
+				cache_cp[cache_n] = cps[j];
+				cache_kc[cache_n] = kcs[j];
+				cache_sh[cache_n] = shs[j];
+				cache_n++;
+			} else if (unicode_to_keycode(cps[j], &kcs[j], &shs[j]) == 0) {
+				/* Found in another layout (e.g. space only in group 0).
+				 * The keycode works universally (same scancode in any layout). */
+				cache_cp[cache_n] = cps[j];
+				cache_kc[cache_n] = kcs[j];
+				cache_sh[cache_n] = shs[j];
+				cache_n++;
+			} else {
+				kcs[j] = 0; shs[j] = -2;
+			}
+		} else if (!found) {
+			kcs[j] = 0; shs[j] = -2;
 		}
 	}
 
-	int target_layout = first_non_ascii_layout;
-	int current_layout = dbus_get_current_layout();
-	if (target_layout < 0) target_layout = 0;
-
-	if (target_layout != current_layout) {
-		dbus_set_layout((unsigned int)target_layout);
-		usleep(80000);
+	int saved_layout = dbus_get_current_layout();
+	int cur = saved_layout;
+	if (primary_layout >= 0 && primary_layout != cur) {
+		dbus_set_layout((unsigned int)primary_layout);
+		usleep(40000);
+		cur = primary_layout;
 	}
 
 	for (int j = 0; j < total_cp; j++) {
-		if (cps[j] < 128) {
-			type_char((char)cps[j], j + 1 < total_cp);
-		} else {
-			type_unicode(cps[j], j + 1 < total_cp);
-		}
+		if (shs[j] < 0) continue;
+		uint16_t evdev_kc = kcs[j] - 8;
+		if (shs[j]) uinput_emit(EV_KEY, KEY_LEFTSHIFT, 1, 1);
+		uinput_emit(EV_KEY, evdev_kc, 1, 1);
+		usleep(opt_key_hold_ms * 1000);
+		uinput_emit(EV_KEY, evdev_kc, 0, 1);
+		if (shs[j]) uinput_emit(EV_KEY, KEY_LEFTSHIFT, 0, 1);
+		if (j + 1 < total_cp && opt_next_delay_ms > 0)
+			usleep(opt_next_delay_ms * 1000);
 	}
 
-	if (target_layout != current_layout) {
-		usleep(50000);
-		dbus_set_layout((unsigned int)current_layout);
+	/* Restore original layout */
+	if (cur != saved_layout) {
+		usleep(30000);
+		dbus_set_layout((unsigned int)saved_layout);
 	}
 }
 

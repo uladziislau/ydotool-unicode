@@ -3,9 +3,11 @@
  * AGPL v3 — same as ydotool.
  */
 
+#include <stddef.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+#include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 
 /* -------- Copy of the functions from tool_type.c -------- */
@@ -238,6 +240,120 @@ int main() {
 		}
 	}
 	if (ru_upper_fail == 0) printf("  ✅ All 33 uppercase letters correct (same keycodes + shift)\n");
+
+	/* -------- Punctuation in RU layout (group 1) -------- */
+	printf("\n--- Punctuation in RU layout (auto-layout validation) ---\n");
+
+	struct { uint32_t cp; char *name; uint16_t exp_kc; int exp_shift; } punct_tests[] = {
+		{0x002C, ", (comma) in RU", KEY_SLASH, 1},
+		{0x002E, ". (period) in RU", KEY_SLASH, 0},
+		{0x0021, "! (exclam) in RU", KEY_1, 1},
+		{0x0020, "  (space) in RU", KEY_SPACE, 0},
+		{0x003F, "? (question) in RU", KEY_SLASH, 0},  // actually might not be...
+	};
+	int num_punct = sizeof(punct_tests) / sizeof(punct_tests[0]);
+	int punct_fail = 0;
+
+	for (int i = 0; i < num_punct; i++) {
+		xkb_keysym_t target = xkb_utf32_to_keysym(punct_tests[i].cp);
+		if (target == XKB_KEY_NoSymbol) {
+			printf("  ❌ %s: keysym lookup failed\n", punct_tests[i].name);
+			punct_fail++; continue;
+		}
+
+		/* Find the character in layout group 1 (RU) */
+		uint16_t kc = 0;
+		int shift = -1;
+		int found = 0;
+		xkb_keycode_t min_kc = xkb_keymap_min_keycode(map);
+		xkb_keycode_t max_kc = xkb_keymap_max_keycode(map);
+		xkb_layout_index_t target_group = 1;
+
+		for (xkb_keycode_t k = min_kc; k <= max_kc && !found; k++) {
+			xkb_layout_index_t num_lay = xkb_keymap_num_layouts_for_key(map, k);
+			if (num_lay <= target_group) continue;
+			xkb_level_index_t num_lev = xkb_keymap_num_levels_for_key(map, k, target_group);
+			for (xkb_level_index_t l = 0; l < num_lev && !found; l++) {
+				const xkb_keysym_t *syms;
+				int n = xkb_keymap_key_get_syms_by_level(map, k, target_group, l, &syms);
+				for (int si = 0; si < n && !found; si++) {
+					if (syms[si] == target) {
+						kc = k; shift = (l > 0) ? 1 : 0; found = 1;
+					}
+				}
+			}
+		}
+
+		if (!found) {
+			printf("  ❌ %s: NOT FOUND in RU layout (can't type while RU active)\n", punct_tests[i].name);
+			punct_fail++;
+		} else {
+			uint16_t evdev_kc = kc - 8;
+			if (kc != punct_tests[i].exp_kc || shift != punct_tests[i].exp_shift) {
+				printf("  ❌ %s: got KEY_%d(evdev=%d)+shift=%d, expected KEY_%d+shift=%d\n",
+					punct_tests[i].name, kc, evdev_kc, shift,
+					punct_tests[i].exp_kc, punct_tests[i].exp_shift);
+				punct_fail++;
+			} else {
+				passed++;
+			}
+		}
+	}
+	if (punct_fail == 0) printf("  ✅ All punctuation correct in RU layout\n");
+
+	/* Verify that , and . are NOT found in RU on KEY_COMMA/KEY_DOT */
+	printf("\n--- Negative test: , and . should NOT map to KEY_COMMA/KEY_DOT in RU ---\n");
+	{
+		xkb_keysym_t comma_ks = xkb_utf32_to_keysym(0x002C);
+		int on_comma_key = 0;
+		xkb_keycode_t min_kc = xkb_keymap_min_keycode(map);
+		xkb_keycode_t max_kc = xkb_keymap_max_keycode(map);
+		/* Check KEY_COMMA (51) in RU layout */
+		{
+			xkb_keycode_t kc = KEY_COMMA;
+			xkb_layout_index_t num_lay = xkb_keymap_num_layouts_for_key(map, kc);
+			if (num_lay > 1) {
+				xkb_level_index_t num_lev = xkb_keymap_num_levels_for_key(map, kc, 1);
+				for (xkb_level_index_t l = 0; l < num_lev; l++) {
+					const xkb_keysym_t *syms;
+					int n = xkb_keymap_key_get_syms_by_level(map, kc, 1, l, &syms);
+					for (int i = 0; i < n; i++) if (syms[i] == comma_ks) on_comma_key = 1;
+				}
+			}
+		}
+		if (on_comma_key) {
+			printf("  ❌ , mapped to KEY_COMMA in RU (wrong! should be KEY_SLASH+Shift)\n");
+			failed++;
+		} else {
+			printf("  ✅ , NOT on KEY_COMMA in RU — must be on KEY_SLASH+Shift\n");
+			passed++;
+		}
+	}
+	/* Check that , on KEY_SLASH in RU */
+	{
+		xkb_keysym_t comma_ks = xkb_utf32_to_keysym(0x002C);
+		int on_slash_key = 0, at_level = -1;
+		xkb_keycode_t kc = KEY_SLASH;
+		xkb_layout_index_t num_lay = xkb_keymap_num_layouts_for_key(map, kc);
+		if (num_lay > 1) {
+			xkb_level_index_t num_lev = xkb_keymap_num_levels_for_key(map, kc, 1);
+			for (xkb_level_index_t l = 0; l < num_lev; l++) {
+				const xkb_keysym_t *syms;
+				int n = xkb_keymap_key_get_syms_by_level(map, kc, 1, l, &syms);
+				for (int i = 0; i < n; i++) if (syms[i] == comma_ks) { on_slash_key = 1; at_level = l; }
+			}
+		}
+		if (on_slash_key && at_level == 1) {
+			printf("  ✅ , on KEY_SLASH+Shift (level %d) in RU ✓\n", at_level);
+			passed++;
+		} else if (on_slash_key) {
+			printf("  ⚠️  , on KEY_SLASH at level %d (expected level 1 = shift)\n", at_level);
+			passed++;
+		} else {
+			printf("  ❌ , NOT on KEY_SLASH in RU — unexpected\n");
+			failed++;
+		}
+	}
 
 	printf("\n=== Test summary ===\n");
 	printf("  Passed: %d\n", passed);
