@@ -66,6 +66,7 @@ static const int32_t ascii2keycode_map[128] = {
 static int opt_key_delay_ms = 20;
 static int opt_key_hold_ms = 20;
 static int opt_next_delay_ms = 0;
+static int opt_auto_layout = 0;
 
 // ---- UTF-8 decoder ----
 
@@ -131,6 +132,115 @@ static void xkb_cleanup(void) {
 	xkb_map = NULL;
 	xkb_ctx = NULL;
 	xkb_initialized = 0;
+}
+
+static int dbus_get_current_layout(void) {
+	FILE *fp = popen("gdbus call --session --dest org.kde.keyboard "
+		"--object-path /Layouts --method org.kde.KeyboardLayouts.getLayout 2>/dev/null", "r");
+	if (!fp) return -1;
+	char buf[64];
+	int result = -1;
+	while (fgets(buf, sizeof(buf), fp)) {
+		if (sscanf(buf, "(uint32 %d,)", &result) >= 1) break;
+	}
+	pclose(fp);
+	return result;
+}
+
+static int dbus_set_layout(unsigned int idx) {
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd),
+		"gdbus call --session --dest org.kde.keyboard "
+		"--object-path /Layouts --method org.kde.KeyboardLayouts.setLayout %u >/dev/null 2>&1", idx);
+	return system(cmd);
+}
+
+static int codepoint_layout_group(uint32_t codepoint) {
+	if (!xkb_map) return -1;
+
+	xkb_keysym_t target = xkb_utf32_to_keysym(codepoint);
+	if (target == XKB_KEY_NoSymbol) return -1;
+
+	xkb_keycode_t min_kc = xkb_keymap_min_keycode(xkb_map);
+	xkb_keycode_t max_kc = xkb_keymap_max_keycode(xkb_map);
+
+	for (xkb_keycode_t kc = min_kc; kc <= max_kc; kc++) {
+		xkb_layout_index_t num_lay = xkb_keymap_num_layouts_for_key(xkb_map, kc);
+		for (xkb_layout_index_t lay = 0; lay < num_lay; lay++) {
+			xkb_level_index_t num_lev = xkb_keymap_num_levels_for_key(xkb_map, kc, lay);
+			for (xkb_level_index_t l = 0; l < num_lev; l++) {
+				const xkb_keysym_t *syms;
+				int n = xkb_keymap_key_get_syms_by_level(xkb_map, kc, lay, l, &syms);
+				for (int i = 0; i < n; i++) {
+					if (syms[i] == target) return (int)lay;
+				}
+			}
+		}
+	}
+	return -1;
+}
+
+static void type_char(char c, bool delay);
+static void type_unicode(uint32_t codepoint, bool delay);
+
+#define MAX_AUTO_CODEPOINTS 4096
+
+static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
+	uint32_t cps[MAX_AUTO_CODEPOINTS];
+	int cp_layout[MAX_AUTO_CODEPOINTS];
+	int total_cp = 0;
+	ssize_t i = 0;
+
+	while (i < len && total_cp < MAX_AUTO_CODEPOINTS) {
+		unsigned char byte = buf[i];
+		if (byte == 0) break;
+		if (byte < 128) {
+			cps[total_cp] = byte;
+			i++;
+		} else {
+			int clen = utf8_char_len(buf + i);
+			if (clen >= 2 && i + clen <= len) {
+				cps[total_cp] = utf8_decode(buf + i, clen);
+				i += clen;
+			} else { i++; continue; }
+		}
+		total_cp++;
+	}
+
+	if (total_cp == 0) return;
+
+	int first_non_ascii_layout = -1;
+	for (int j = 0; j < total_cp; j++) {
+		if (cps[j] < 128) {
+			cp_layout[j] = 0;
+		} else {
+			cp_layout[j] = codepoint_layout_group(cps[j]);
+			if (first_non_ascii_layout < 0 && cp_layout[j] >= 0)
+				first_non_ascii_layout = cp_layout[j];
+		}
+	}
+
+	int target_layout = first_non_ascii_layout;
+	int current_layout = dbus_get_current_layout();
+	if (target_layout < 0) target_layout = 0;
+
+	if (target_layout != current_layout) {
+		dbus_set_layout((unsigned int)target_layout);
+		usleep(80000);
+	}
+
+	for (int j = 0; j < total_cp; j++) {
+		if (cps[j] < 128) {
+			type_char((char)cps[j], j + 1 < total_cp);
+		} else {
+			type_unicode(cps[j], j + 1 < total_cp);
+		}
+	}
+
+	if (target_layout != current_layout) {
+		usleep(50000);
+		dbus_set_layout((unsigned int)current_layout);
+	}
 }
 
 // Find a keycode + shift flag for a Unicode codepoint.
@@ -364,6 +474,8 @@ static void show_help(void) {
 		"  -f, --file=PATH            Specify a file, the contents of which will be be typed as if passed as an argument.\n"
 		"                               The filepath may also be '-' to read from stdin\n"
 		"  -e, --escape=BOOL          Escape enable (1) or disable (0)\n"
+		"  -A, --auto-layout          Automatically switch keyboard layout to match text content.\n"
+		"                               Requires KDE Plasma 6 with D-Bus (gdbus).\n"
 		"  -h, --help                 Display this help and exit\n"
 		"\n"
 		"Escape is enabled by default when typing command line arguments, and disabled by default when typing from file and stdin."
@@ -392,6 +504,7 @@ int tool_type(int argc, char **argv) {
 			{"key-delay", required_argument, 0, 'd'},
 			{"next-delay", required_argument, 0, 'D'},
 			{"key-hold", required_argument, 0, 'H'},
+			{"auto-layout", no_argument, 0, 'A'},
 			{"escape", required_argument, 0, 'e'},
 			{"file", required_argument, 0, 'f'},
 			{"help", no_argument, 0, 'h'},
@@ -399,7 +512,7 @@ int tool_type(int argc, char **argv) {
 		};
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "hd:D:H:f:e:",
+		c = getopt_long(argc, argv, "hd:D:H:f:e:A",
 				 long_options, &option_index);
 
 		if (c == -1)
@@ -433,6 +546,9 @@ int tool_type(int argc, char **argv) {
 			case 'e':
 				enable_escape = strtol(optarg, NULL, 10);
 				break;
+			case 'A':
+				opt_auto_layout = 1;
+				break;
 			case '?':
 				break;
 			default:
@@ -459,7 +575,8 @@ int tool_type(int argc, char **argv) {
 		ssize_t rc;
 		while ((rc = read(fd, buf, sizeof(buf)))) {
 			if (rc > 0) {
-				type_text(buf, rc, enable_escape);
+				if (opt_auto_layout) type_text_auto_layout(buf, rc);
+				else type_text(buf, rc, enable_escape);
 			} else if (rc < 0) {
 				fprintf(stderr, "ydotool: type: error: read %s failed: %s\n", file_path, strerror(errno));
 				return 2;
@@ -473,7 +590,8 @@ int tool_type(int argc, char **argv) {
 		if (optind < argc) {
 			while (optind < argc) {
 				char *pstr = argv[optind++];
-				type_text((unsigned char *)pstr, strlen(pstr), enable_escape);
+				if (opt_auto_layout) type_text_auto_layout((unsigned char *)pstr, strlen(pstr));
+				else type_text((unsigned char *)pstr, strlen(pstr), enable_escape);
 
 				if (argv[optind])
 					usleep(opt_next_delay_ms * 1000);
