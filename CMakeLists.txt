@@ -15,6 +15,10 @@ if (${RC_GIT_VER} EQUAL 0)
     add_definitions(-DVERSION=\"${GIT_VERSION}\")
 endif()
 
+# Find xkbcommon for Unicode input support
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
+
 set(SOURCE_FILES_DAEMON Daemon/ydotoold.c)
 set(SOURCE_FILES_CLIENT Client/ydotool.c Client/tool_click.c Client/tool_mousemove.c Client/tool_type.c Client/tool_key.c Client/tool_stdin.c)
 
@@ -22,6 +26,7 @@ add_executable(ydotoold ${SOURCE_FILES_DAEMON})
 install(TARGETS ydotoold DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_executable(ydotool ${SOURCE_FILES_CLIENT})
+target_link_libraries(ydotool PRIVATE PkgConfig::XKBCOMMON)
 install(TARGETS ydotool DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_subdirectory(Daemon)
