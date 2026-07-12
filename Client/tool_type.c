@@ -66,7 +66,7 @@ static const int32_t ascii2keycode_map[128] = {
 static int opt_key_delay_ms = 20;
 static int opt_key_hold_ms = 20;
 static int opt_next_delay_ms = 0;
-static int opt_auto_layout = 0;
+static int opt_auto_layout = 1;
 
 // ---- UTF-8 decoder ----
 
@@ -550,7 +550,8 @@ static void show_help(void) {
 		"  -f, --file=PATH            Specify a file, the contents of which will be be typed as if passed as an argument.\n"
 		"                               The filepath may also be '-' to read from stdin\n"
 		"  -e, --escape=BOOL          Escape enable (1) or disable (0)\n"
-		"  -A, --auto-layout          Automatically switch keyboard layout to match text content.\n"
+		"  -A, --auto-layout          Enable keyboard layout auto-switching (default: on).\n"
+		"      --no-auto-layout       Disable keyboard layout auto-switching.\n"
 		"                               Requires KDE Plasma 6 with D-Bus (gdbus).\n"
 		"  -h, --help                 Display this help and exit\n"
 		"\n"
@@ -581,6 +582,7 @@ int tool_type(int argc, char **argv) {
 			{"next-delay", required_argument, 0, 'D'},
 			{"key-hold", required_argument, 0, 'H'},
 			{"auto-layout", no_argument, 0, 'A'},
+			{"no-auto-layout", no_argument, 0, 'n'},
 			{"escape", required_argument, 0, 'e'},
 			{"file", required_argument, 0, 'f'},
 			{"help", no_argument, 0, 'h'},
@@ -588,7 +590,7 @@ int tool_type(int argc, char **argv) {
 		};
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "hd:D:H:f:e:A",
+		c = getopt_long(argc, argv, "hd:D:H:f:e:An",
 				 long_options, &option_index);
 
 		if (c == -1)
@@ -624,6 +626,9 @@ int tool_type(int argc, char **argv) {
 				break;
 			case 'A':
 				opt_auto_layout = 1;
+				break;
+			case 'n':
+				opt_auto_layout = 0;
 				break;
 			case '?':
 				break;
