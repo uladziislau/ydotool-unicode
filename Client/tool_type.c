@@ -294,7 +294,9 @@ static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
 
 	int saved_layout = dbus_get_current_layout();
 	int cur = saved_layout;
-	if (primary_layout >= 0 && primary_layout != cur) {
+
+	/* Skip layout switching if D-Bus is unavailable (non-KDE) */
+	if (saved_layout >= 0 && primary_layout >= 0 && primary_layout != saved_layout) {
 		dbus_set_layout((unsigned int)primary_layout);
 		usleep(40000);
 		cur = primary_layout;
@@ -312,8 +314,8 @@ static void type_text_auto_layout(const unsigned char *buf, ssize_t len) {
 			usleep(opt_next_delay_ms * 1000);
 	}
 
-	/* Restore original layout */
-	if (cur != saved_layout) {
+	/* Restore original layout (only if D-Bus is available and we switched) */
+	if (cur != saved_layout && saved_layout >= 0) {
 		usleep(30000);
 		dbus_set_layout((unsigned int)saved_layout);
 	}
